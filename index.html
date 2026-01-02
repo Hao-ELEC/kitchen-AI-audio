@@ -411,6 +411,503 @@
 
     // 初始渲染库存
     renderInventoryTable();
-  </script>
-</body>
-</html>
+    // ===================== 语音：ASR + TTS =====================
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    
+    let recognition = null;
+    let listening = false;
+    
+    function speakCN(text) {
+      // 温柔、短句
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "zh-CN";
+      u.rate = 1.0;
+      u.pitch = 1.05;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+    }
+    
+    function logChat(role, text) {
+      const el = document.getElementById("chatLog");
+      el.textContent += `${role}：${text}\n`;
+    }
+    
+    function setASRStatus(text) {
+      document.getElementById("asrStatus").textContent = `语音状态：${text}`;
+    }
+    
+    function setASRText(text) {
+      document.getElementById("asrText").textContent = text || "-";
+    }
+    
+    // ===================== 对话状态机（MVP） =====================
+    const AGENT_KEY = "kitchen_agent_state_v1";
+    const PDCA_KEY = "kitchen_pdca_v1";
+    
+    const State = {
+      IDLE: "IDLE",
+      ASK_INV_NAME: "ASK_INV_NAME",
+      ASK_INV_QTY: "ASK_INV_QTY",
+      ASK_INV_EXP: "ASK_INV_EXP",
+      ASK_MORE_INV: "ASK_MORE_INV",
+      RECOMMENDED: "RECOMMENDED",
+      ASK_ADD_MORE: "ASK_ADD_MORE",
+      SELECT_DISH: "SELECT_DISH",
+      CONFIRM_DEDUCT: "CONFIRM_DEDUCT",
+      DEDUCT_QTY_LOOP: "DEDUCT_QTY_LOOP",
+      PDCA: "PDCA"
+    };
+    
+    let agent = {
+      state: State.IDLE,
+      pendingInv: { name: "", qty: 0, exp: "" },
+      selectedRecipe: null,
+      deductQueue: [],
+      deductPlan: {}
+    };
+    
+    function resetAgent() {
+      agent = {
+        state: State.IDLE,
+        pendingInv: { name: "", qty: 0, exp: "" },
+        selectedRecipe: null,
+        deductQueue: [],
+        deductPlan: {}
+      };
+    }
+    
+    // 简单意图识别（先规则，后续可换 LLM）
+    function detectIntent(text) {
+      const t = text.replace(/\s+/g, "");
+      if (/做饭|做菜|炒菜|吃什么|推荐|菜单|想吃/.test(t)) return "START_COOK";
+      if (/更多食材|新食材|再加|我还有|我买了/.test(t)) return "ADD_ING";
+      if (/没有|就这些|不用了|结束/.test(t)) return "NO_MORE";
+      if (/第([一二三四五])个|第(\d+)个|我选|就做|做(.+)/.test(t)) return "CHOOSE_DISH";
+      if (/可以|行|好|ok|OK|好的|同意/.test(t)) return "YES";
+      if (/不|不要|算了/.test(t)) return "NO";
+      return "UNKNOWN";
+    }
+    
+    // 解析“第几个”
+    function parseIndex(text) {
+      const t = text.replace(/\s+/g, "");
+      const m1 = t.match(/第(\d+)个/);
+      if (m1) return parseInt(m1[1], 10) - 1;
+    
+      const map = { 一:0, 二:1, 三:2, 四:3, 五:4 };
+      const m2 = t.match(/第([一二三四五])个/);
+      if (m2) return map[m2[1]];
+    
+      return null;
+    }
+    
+    // 解析数量：提取数字（“六”暂不做，MVP先要用户说数字）
+    function parseQty(text) {
+      const m = text.match(/(\d+)/);
+      if (!m) return null;
+      return parseInt(m[1], 10);
+    }
+    
+    // 解析日期：支持 2026-01-10 / 1月10日 / 01-10
+    function parseDate(text) {
+      const t = text.replace(/\s+/g, "");
+      // YYYY-MM-DD
+      let m = t.match(/(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})/);
+      if (m) return `${m[1]}-${String(m[2]).padStart(2,"0")}-${String(m[3]).padStart(2,"0")}`;
+    
+      // MM-DD
+      m = t.match(/(\d{1,2})[-\/](\d{1,2})/);
+      if (m) {
+        const y = new Date().getFullYear();
+        return `${y}-${String(m[1]).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`;
+      }
+    
+      // 1月10日 / 1月10号
+      m = t.match(/(\d{1,2})月(\d{1,2})(日|号)?/);
+      if (m) {
+        const y = new Date().getFullYear();
+        return `${y}-${String(m[1]).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`;
+      }
+    
+      return null;
+    }
+    
+    // ===================== 关键：把页面推荐结果保存下来（供“选第几个”用） =====================
+    let lastTop5 = []; // 保存最近一次推荐的 top5 recipes（顺序对应1-5）
+    
+    async function recommendTop5(extraText = "") {
+      // 直接复用你当前按钮的逻辑：这里复制“生成推荐”的核心，但不点按钮
+      const output = document.getElementById("output");
+      const hint = document.getElementById("hint");
+      const list = document.getElementById("list");
+    
+      output.textContent = "处理中...";
+      hint.textContent = "";
+      list.innerHTML = "";
+    
+      const inv = loadInventory();
+      const invSet = new Set(Object.keys(inv).filter(k => inv[k].qty > 0));
+      const extra = new Set(normalizeInput(extraText));
+    
+      if (invSet.size === 0 && extra.size === 0) {
+        output.textContent = "";
+        hint.textContent = "请先录入库存，或输入额外食材。";
+        lastTop5 = [];
+        return [];
+      }
+    
+      const recipes = await loadRecipes();
+    
+      const candidates = recipes
+        .map(r => {
+          const s = scoreRecipe(r, inv, extra);
+          const available = new Set([...invSet, ...extra]);
+          const usedFromAvailable = r.ingredients.filter(ing => available.has(ing));
+          return { recipe: r, ...s, usedFromAvailable, usedCount: usedFromAvailable.length };
+        })
+        .filter(x => x.usedCount >= 1)
+        .filter(x => x.missingCount <= 1);
+    
+      if (candidates.length === 0) {
+        output.textContent = "未找到可推荐菜品";
+        hint.textContent = "规则：只推荐缺 0 或缺 1 个主食材，且必须用到你现有的食材。";
+        lastTop5 = [];
+        return [];
+      }
+    
+      candidates.sort((a, b) => {
+        if (a.missingCount !== b.missingCount) return a.missingCount - b.missingCount;
+        if (a.earliestExpiryDaysUsed !== b.earliestExpiryDaysUsed) return a.earliestExpiryDaysUsed - b.earliestExpiryDaysUsed;
+        if (a.totalQtyUsed !== b.totalQtyUsed) return b.totalQtyUsed - a.totalQtyUsed;
+        return a.recipeIngredientCount - b.recipeIngredientCount;
+      });
+    
+      const top5 = candidates.slice(0, 5);
+      lastTop5 = top5.map(x => x.recipe);
+    
+      output.textContent = "推荐菜品（点击可扣库存，最多 5 个）：";
+    
+      top5.forEach((item, index) => {
+        const li = document.createElement("li");
+        const r = item.recipe;
+        const missingText = item.missingCount === 0 ? "✅ 食材齐全" : `⚠️ 缺：${item.missing[0]}`;
+        li.innerHTML = `
+          <div>
+            <strong>${index + 1}. ${r.name}</strong>
+            <span class="pill">${missingText}</span>
+          </div>
+          <div class="small"><b>Ingredients</b>：${r.ingredients.join("、")}</div>
+          <div class="small"><b>Seasonings</b>：${(r.seasonings || []).join("、")}</div>
+        `;
+        li.style.cursor = "pointer";
+        li.addEventListener("click", () => {
+          // 直接走你现有的点击扣库存（但语音流程里我们会做二次确认）
+          consumeRecipe(r);
+        });
+        list.appendChild(li);
+      });
+    
+      hint.textContent = "排序：缺0优先，其次最早到期↑、数量优先↓、食材数↑。";
+      return lastTop5;
+    }
+    
+    // ===================== 对话处理入口 =====================
+    async function handleUserText(text) {
+      if (!text) return;
+      logChat("人", text);
+    
+      const inv = loadInventory();
+      const hasInventory = Object.keys(inv).some(k => inv[k].qty > 0);
+    
+      const intent = detectIntent(text);
+    
+      // IDLE: 用户说“做饭/推荐”
+      if (agent.state === State.IDLE) {
+        if (intent === "START_COOK") {
+          const greet = "我是AI厨房助手，有什么能帮您？";
+          logChat("AI", greet); speakCN(greet);
+    
+          if (!hasInventory) {
+            agent.state = State.ASK_INV_NAME;
+            const q = "我先帮您记录冰箱库存。冰箱里有什么食材？请说一个食材名称。";
+            logChat("AI", q); speakCN(q);
+          } else {
+            agent.state = State.RECOMMENDED;
+            const q = "好的。我将基于您现有库存，给您推荐5个菜品。";
+            logChat("AI", q); speakCN(q);
+            await recommendTop5("");
+            const q2 = "如果您想新增食材，说“更多食材”。如果要选择菜品，说“我选第几个”。";
+            logChat("AI", q2); speakCN(q2);
+          }
+          return;
+        }
+    
+        const tip = "您可以说：做饭、推荐菜、今天吃什么。";
+        logChat("AI", tip); speakCN(tip);
+        return;
+      }
+    
+      // 录入库存三问
+      if (agent.state === State.ASK_INV_NAME) {
+        if (intent === "NO_MORE") {
+          const t = "好的。那我先为您推荐菜品。";
+          logChat("AI", t); speakCN(t);
+          agent.state = State.RECOMMENDED;
+          await recommendTop5("");
+          return;
+        }
+        agent.pendingInv.name = text.trim();
+        agent.state = State.ASK_INV_QTY;
+        const q = `${agent.pendingInv.name} 有多少？请说数字。`;
+        logChat("AI", q); speakCN(q);
+        return;
+      }
+    
+      if (agent.state === State.ASK_INV_QTY) {
+        const qty = parseQty(text);
+        if (!qty || qty <= 0) {
+          const q = "我没听清数量。请只说数字，例如 6。";
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+        agent.pendingInv.qty = qty;
+        agent.state = State.ASK_INV_EXP;
+        const q = "保质期到哪天？请说日期，例如 2026-01-10 或 1月10日。";
+        logChat("AI", q); speakCN(q);
+        return;
+      }
+    
+      if (agent.state === State.ASK_INV_EXP) {
+        const d = parseDate(text);
+        if (!d) {
+          const q = "我没听清日期。请说例如 2026-01-10 或 1月10日。";
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+        agent.pendingInv.exp = d;
+    
+        // 写入库存（复用你现有逻辑：同名合并、到期取更近）
+        const inv2 = loadInventory();
+        const name = agent.pendingInv.name;
+        const qty = agent.pendingInv.qty;
+        const exp = agent.pendingInv.exp;
+    
+        if (!inv2[name]) inv2[name] = { qty, expiresAt: exp };
+        else {
+          inv2[name].qty = Number(inv2[name].qty || 0) + qty;
+          if (exp && inv2[name].expiresAt) {
+            inv2[name].expiresAt = (daysLeft(exp) < daysLeft(inv2[name].expiresAt)) ? exp : inv2[name].expiresAt;
+          } else if (exp && !inv2[name].expiresAt) inv2[name].expiresAt = exp;
+        }
+        saveInventory(inv2);
+        renderInventoryTable();
+    
+        const ok = `已记录：${name} 数量 ${qty}，到期 ${exp}。还有其他食材吗？如果没有请说“没有”。`;
+        logChat("AI", ok); speakCN(ok);
+        agent.state = State.ASK_INV_NAME;
+        agent.pendingInv = { name:"", qty:0, exp:"" };
+        return;
+      }
+    
+      // 推荐后：新增食材 or 选择菜品
+      if (agent.state === State.RECOMMENDED) {
+        if (intent === "ADD_ING") {
+          agent.state = State.ASK_INV_NAME;
+          const q = "好的，请说要新增的食材名称。";
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+    
+        if (intent === "CHOOSE_DISH") {
+          // 解析 “第几个” 或 “做xxx”
+          let idx = parseIndex(text);
+          let chosen = null;
+    
+          if (idx !== null && lastTop5[idx]) chosen = lastTop5[idx];
+    
+          // 兜底：按菜名匹配（“就做xx”）
+          if (!chosen) {
+            const t = text.replace(/\s+/g, "");
+            chosen = lastTop5.find(r => t.includes(r.name.replace(/\s+/g,"")));
+          }
+    
+          if (!chosen) {
+            const q = "我没听清您选的是第几个。请说：我选第1个/第2个。";
+            logChat("AI", q); speakCN(q);
+            return;
+          }
+    
+          agent.selectedRecipe = chosen;
+          agent.state = State.CONFIRM_DEDUCT;
+    
+          const q = `好的，您选择了：${chosen.name}。我可以为您删除（扣减）冰箱里相应食材数量吗？`;
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+    
+        const q = "您可以说：更多食材，或 我选第几个。";
+        logChat("AI", q); speakCN(q);
+        return;
+      }
+    
+      // 二次确认扣库存
+      if (agent.state === State.CONFIRM_DEDUCT) {
+        if (intent === "YES") {
+          const r = agent.selectedRecipe;
+          const inv3 = loadInventory();
+          const need = r.ingredients.filter(ing => inv3[ing] && inv3[ing].qty > 0);
+    
+          if (need.length === 0) {
+            const q = "这道菜在库存里没有可扣减的食材（可能没录入）。我先不扣减。";
+            logChat("AI", q); speakCN(q);
+            agent.state = State.PDCA;
+            const p = "为了更好帮助您，今天推荐是否符合口味？您更偏好清淡/下饭/快手哪种？";
+            logChat("AI", p); speakCN(p);
+            return;
+          }
+    
+          agent.deductQueue = need.slice();
+          agent.deductPlan = {};
+          agent.state = State.DEDUCT_QTY_LOOP;
+    
+          const ing = agent.deductQueue[0];
+          const max = inv3[ing].qty;
+          const q = `请说要消耗的 ${ing} 数量。库存剩余 ${max}。例如说 1。`;
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+    
+        if (intent === "NO") {
+          const q = "好的，我不扣减库存。";
+          logChat("AI", q); speakCN(q);
+          agent.state = State.PDCA;
+          const p = "为了更好帮助您，今天推荐是否符合口味？您更偏好清淡/下饭/快手哪种？";
+          logChat("AI", p); speakCN(p);
+          return;
+        }
+    
+        const q = "请回答：可以 或 不要。";
+        logChat("AI", q); speakCN(q);
+        return;
+      }
+    
+      // 扣库存：逐个食材询问数量
+      if (agent.state === State.DEDUCT_QTY_LOOP) {
+        const r = agent.selectedRecipe;
+        const inv4 = loadInventory();
+    
+        const ing = agent.deductQueue[0];
+        const max = inv4[ing].qty;
+        const qty = parseQty(text);
+    
+        if (!qty || qty <= 0 || qty > max) {
+          const q = `数量不合法。请说 1 到 ${max} 之间的数字。`;
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+    
+        agent.deductPlan[ing] = qty;
+        agent.deductQueue.shift();
+    
+        if (agent.deductQueue.length > 0) {
+          const next = agent.deductQueue[0];
+          const max2 = inv4[next].qty;
+          const q = `请说要消耗的 ${next} 数量。库存剩余 ${max2}。`;
+          logChat("AI", q); speakCN(q);
+          return;
+        }
+    
+        // 执行扣减
+        for (const k of Object.keys(agent.deductPlan)) {
+          inv4[k].qty -= agent.deductPlan[k];
+          if (inv4[k].qty < 0) inv4[k].qty = 0;
+        }
+        saveInventory(inv4);
+        renderInventoryTable();
+    
+        const remainLines = Object.keys(agent.deductPlan)
+          .map(k => `${k} 现在剩余 ${inv4[k].qty}`)
+          .join("，");
+    
+        const done = `已扣减完成。${remainLines}。`;
+        logChat("AI", done); speakCN(done);
+    
+        // 进入 PDCA
+        agent.state = State.PDCA;
+        const p = "为了更好帮助您，今天推荐是否符合口味？您更偏好清淡/下饭/快手哪种？";
+        logChat("AI", p); speakCN(p);
+        return;
+      }
+    
+      // PDCA：收集一句偏好并存储
+      if (agent.state === State.PDCA) {
+        const pdca = { time: new Date().toISOString(), feedback: text };
+        localStorage.setItem(PDCA_KEY, JSON.stringify(pdca));
+    
+        const q = "收到。我会记住您的偏好，下次推荐会更贴合。需要我继续推荐菜吗？";
+        logChat("AI", q); speakCN(q);
+    
+        agent.state = State.RECOMMENDED; // 回到推荐态
+        return;
+      }
+    }
+    
+    // ===================== 绑定语音按钮 =====================
+    document.getElementById("voiceBtn").addEventListener("click", () => {
+      if (!SpeechRecognition) {
+        alert("当前浏览器不支持语音识别。请使用 Chrome/Edge。");
+        return;
+      }
+    
+      if (!recognition) {
+        recognition = new SpeechRecognition();
+        recognition.lang = "zh-CN";
+        recognition.interimResults = false;
+        recognition.continuous = true;
+    
+        recognition.onresult = async (event) => {
+          const last = event.results[event.results.length - 1];
+          const text = last[0].transcript || "";
+          setASRText(text);
+          await handleUserText(text);
+        };
+    
+        recognition.onerror = (e) => {
+          setASRStatus("出错：" + e.error);
+          logChat("系统", "ASR错误：" + e.error);
+        };
+    
+        recognition.onend = () => {
+          // 如果用户没点停止，自动续听（避免识别自动停）
+          if (listening) {
+            try { recognition.start(); } catch {}
+          } else {
+            setASRStatus("已停止");
+          }
+        };
+      }
+    
+      if (!listening) {
+        listening = true;
+        setASRStatus("监听中…");
+        document.getElementById("voiceBtn").textContent = "⏹️ 停止语音对话";
+        if (agent.state === State.IDLE) {
+          const greet = "我是AI厨房助手。您可以说：做饭、推荐菜、今天吃什么。";
+          logChat("AI", greet); speakCN(greet);
+        }
+        try { recognition.start(); } catch {}
+      } else {
+        listening = false;
+        document.getElementById("voiceBtn").textContent = "🎙️ 开始语音对话";
+        try { recognition.stop(); } catch {}
+        setASRStatus("已停止");
+      }
+    });
+    
+    
+    
+    
+        
+      </script>
+    </body>
+    </html>
