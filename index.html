@@ -74,6 +74,14 @@
 
     <button id="btn">生成推荐菜品</button>
 
+    <button id="voiceBtn">🎙️ 开始语音对话</button>
+    <div class="hint" id="asrStatus">语音状态：未开始</div>
+    <div class="card" style="margin-top:12px;">
+      <div class="small"><b>识别文本</b>：<span id="asrText">-</span></div>
+      <div class="small"><b>AI对话</b>：</div>
+      <div id="chatLog" class="small" style="white-space:pre-wrap;"></div>
+    </div>
+
     <div class="result" id="output"></div>
     <ul id="list"></ul>
     <div class="hint" id="hint"></div>
